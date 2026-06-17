@@ -45,6 +45,10 @@ const transactionSchema = new mongoose.Schema({
     type: Number,
     default: 0,
   },
+  fromFrozen: {
+    type: Number,
+    default: 0,
+  },
   order: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'RentalOrder',

@@ -6,7 +6,7 @@ const NotificationService = require('./notificationService');
 const RealtimeService = require('./realtimeService');
 
 class TransactionService {
-  static async create(userId, type, amount, direction, description = '', extra = {}, freezeOnly = false) {
+  static async create(userId, type, amount, direction, description = '', extra = {}, freezeOnly = false, orderDepositRequired = null) {
     return await withTransaction(async ({ session, useTransaction }) => {
       const sessionOpt = useTransaction ? session : null;
 
@@ -22,6 +22,7 @@ class TransactionService {
       const frozenBefore = user.frozenDeposit || 0;
       let balanceAfter = balanceBefore;
       let frozenAfter = frozenBefore;
+      let fromFrozen = 0;
 
       if (type === TRANSACTION_TYPE.DEPOSIT_FREEZE) {
         if ((balanceBefore - frozenBefore) < amount) {
@@ -38,7 +39,10 @@ class TransactionService {
           if (balanceBefore < amount) {
             throw new Error(`押金余额不足，无法扣除赔偿金¥${amount}（当前余额¥${balanceBefore}）`);
           }
-          const fromFrozen = Math.min(frozenBefore, amount);
+          const maxFrozenUsable = orderDepositRequired != null
+            ? Math.min(frozenBefore, orderDepositRequired)
+            : frozenBefore;
+          fromFrozen = Math.min(maxFrozenUsable, amount);
           frozenAfter = frozenBefore - fromFrozen;
           balanceAfter = balanceBefore - amount;
         } else {
@@ -63,6 +67,7 @@ class TransactionService {
         balanceAfter,
         frozenBefore,
         frozenAfter,
+        fromFrozen,
         description,
         ...extra,
       };
@@ -75,6 +80,7 @@ class TransactionService {
         balanceAfter,
         frozenBefore,
         frozenAfter,
+        fromFrozen,
       };
     });
   }
@@ -179,7 +185,7 @@ class TransactionService {
     return result;
   }
 
-  static async deductCompensation(userId, amount, orderId, damageReportId, operatorId = null) {
+  static async deductCompensation(userId, amount, orderId, damageReportId, operatorId = null, orderDepositRequired = null) {
     const result = await this.create(
       userId,
       TRANSACTION_TYPE.COMPENSATION,
@@ -190,7 +196,9 @@ class TransactionService {
         order: orderId,
         damageReport: damageReportId,
         operator: operatorId,
-      }
+      },
+      false,
+      orderDepositRequired
     );
     RealtimeService.emitToUser(userId, {
       type: 'payment.compensation.deducted',

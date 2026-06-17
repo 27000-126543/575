@@ -84,6 +84,11 @@ const damageController = {
     }
 
     let paymentInfo = { paid: false, failed: false, message: '' };
+    let relatedOrder = null;
+
+    try {
+      relatedOrder = await RentalOrder.findById(report.order);
+    } catch (_) {}
 
     await withTransaction(async ({ session, useTransaction }) => {
       const sessionOpt = useTransaction ? session : null;
@@ -93,15 +98,17 @@ const damageController = {
 
         let txnResult = null;
         try {
+          const orderDeposit = relatedOrder && relatedOrder.depositRequired > 0 ? relatedOrder.depositRequired : null;
           txnResult = await TransactionService.deductCompensation(
             report.user,
             report.totalCompensation,
             report.order,
             report._id,
-            req.userId
+            req.userId,
+            orderDeposit
           );
           await report.markCompensated(txnResult.transaction._id);
-          paymentInfo = { paid: true, failed: false, message: '赔偿扣款成功', transactionId: txnResult.transaction._id };
+          paymentInfo = { paid: true, failed: false, message: '赔偿扣款成功', transactionId: txnResult.transaction._id, fromFrozen: txnResult.fromFrozen || 0 };
         } catch (txnError) {
           console.warn('赔偿扣款失败，保留待支付状态:', txnError.message);
           await report.markPaymentFailed(txnError.message || '扣款失败', req.userId);
@@ -144,13 +151,13 @@ const damageController = {
 
         if (paymentInfo.paid) {
           try {
-            const orderForFrozen = await RentalOrder.findById(report.order);
-            if (orderForFrozen && orderForFrozen.depositFrozen && orderForFrozen.depositRequired > 0) {
-              const leftFrozen = txnResult ? (txnResult.frozenAfter || 0) : 0;
-              if (leftFrozen > 0) {
+            if (relatedOrder && relatedOrder.depositFrozen && relatedOrder.depositRequired > 0) {
+              const fromFrozen = txnResult ? (txnResult.fromFrozen || 0) : 0;
+              const leftoverForOrder = Math.max(0, relatedOrder.depositRequired - fromFrozen);
+              if (leftoverForOrder > 0) {
                 await TransactionService.unfreezeDeposit(
                   report.user,
-                  leftFrozen,
+                  leftoverForOrder,
                   report.order,
                   '赔偿完成后释放剩余冻结押金'
                 );
@@ -241,17 +248,21 @@ const damageController = {
 
     let paymentInfo = { paid: false, failed: false, message: '' };
 
+    const relatedOrder = await RentalOrder.findById(report.order);
+
     try {
       await report.markPendingPayment(req.userId, '用户/管理员主动发起赔偿扣款');
+      const orderDeposit = relatedOrder && relatedOrder.depositRequired > 0 ? relatedOrder.depositRequired : null;
       const txnResult = await TransactionService.deductCompensation(
         report.user,
         report.totalCompensation,
         report.order,
         report._id,
-        req.userId
+        req.userId,
+        orderDeposit
       );
       await report.markCompensated(txnResult.transaction._id);
-      paymentInfo = { paid: true, failed: false, message: '赔偿扣款成功', transactionId: txnResult.transaction._id };
+      paymentInfo = { paid: true, failed: false, message: '赔偿扣款成功', transactionId: txnResult.transaction._id, fromFrozen: txnResult.fromFrozen || 0 };
 
       const { RentalOrder } = require('../models');
       const order = await RentalOrder.findById(report.order);
@@ -260,12 +271,13 @@ const damageController = {
       }
 
       if (order && order.depositFrozen && order.depositRequired > 0) {
-        const remainingFrozen = (txnResult.frozenAfter || 0);
-        if (remainingFrozen > 0) {
+        const fromFrozen = txnResult.fromFrozen || 0;
+        const leftoverForOrder = Math.max(0, order.depositRequired - fromFrozen);
+        if (leftoverForOrder > 0) {
           try {
             await TransactionService.unfreezeDeposit(
               report.user,
-              remainingFrozen,
+              leftoverForOrder,
               report.order,
               '赔偿完成后释放剩余冻结押金'
             );
