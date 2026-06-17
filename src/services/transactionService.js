@@ -3,9 +3,10 @@ const { User, Transaction } = require('../models');
 const { TRANSACTION_TYPE } = require('../config/constants');
 const { generateTransactionNo, withTransaction, sessionSave, sessionCreate } = require('../utils/helpers');
 const NotificationService = require('./notificationService');
+const RealtimeService = require('./realtimeService');
 
 class TransactionService {
-  static async create(userId, type, amount, direction, description = '', extra = {}) {
+  static async create(userId, type, amount, direction, description = '', extra = {}, freezeOnly = false) {
     return await withTransaction(async ({ session, useTransaction }) => {
       const sessionOpt = useTransaction ? session : null;
 
@@ -18,18 +19,39 @@ class TransactionService {
       }
 
       const balanceBefore = user.depositBalance;
+      const frozenBefore = user.frozenDeposit || 0;
       let balanceAfter = balanceBefore;
+      let frozenAfter = frozenBefore;
 
-      if (direction === 'in') {
+      if (type === TRANSACTION_TYPE.DEPOSIT_FREEZE) {
+        if ((balanceBefore - frozenBefore) < amount) {
+          throw new Error('可用押金不足，无法冻结');
+        }
+        frozenAfter = frozenBefore + amount;
+      } else if (type === TRANSACTION_TYPE.DEPOSIT_UNFREEZE) {
+        const unfreezeAmount = Math.min(frozenBefore, amount);
+        frozenAfter = frozenBefore - unfreezeAmount;
+      } else if (direction === 'in') {
         balanceAfter = balanceBefore + amount;
       } else {
-        if (balanceBefore < amount) {
-          throw new Error('押金余额不足');
+        if (type === TRANSACTION_TYPE.COMPENSATION) {
+          const fromFrozen = Math.min(frozenBefore, amount);
+          const remaining = amount - fromFrozen;
+          frozenAfter = frozenBefore - fromFrozen;
+          balanceAfter = balanceBefore - remaining;
+          if (balanceAfter < 0) {
+            throw new Error('押金余额不足');
+          }
+        } else {
+          if (balanceBefore < amount) {
+            throw new Error('押金余额不足');
+          }
+          balanceAfter = balanceBefore - amount;
         }
-        balanceAfter = balanceBefore - amount;
       }
 
       user.depositBalance = balanceAfter;
+      user.frozenDeposit = frozenAfter;
       await sessionSave(user, sessionOpt);
 
       const txnData = {
@@ -40,6 +62,8 @@ class TransactionService {
         direction,
         balanceBefore,
         balanceAfter,
+        frozenBefore,
+        frozenAfter,
         description,
         ...extra,
       };
@@ -50,6 +74,8 @@ class TransactionService {
         user,
         balanceBefore,
         balanceAfter,
+        frozenBefore,
+        frozenAfter,
       };
     });
   }
@@ -63,6 +89,54 @@ class TransactionService {
       '用户充值押金',
       { operator: operatorId }
     );
+    RealtimeService.emitToUser(userId, {
+      type: 'deposit.completed',
+      payload: {
+      amount,
+      newBalance: result.balanceAfter,
+      },
+    });
+    return result;
+  }
+
+  static async freezeDeposit(userId, amount, orderId = null, operatorId = null) {
+    const result = await this.create(
+      userId,
+      TRANSACTION_TYPE.DEPOSIT_FREEZE,
+      amount,
+      'freeze',
+      '订单押金冻结',
+      { order: orderId, operator: operatorId }
+    );
+    RealtimeService.emitToUser(userId, {
+      type: 'deposit.frozen',
+      payload: {
+      amount,
+      orderId,
+      frozenDeposit: result.frozenAfter,
+      },
+    });
+    return result;
+  }
+
+  static async unfreezeDeposit(userId, amount, orderId = null, reason = '押金释放', operatorId = null) {
+    const result = await this.create(
+      userId,
+      TRANSACTION_TYPE.DEPOSIT_UNFREEZE,
+      amount,
+      'unfreeze',
+      reason,
+      { order: orderId, operator: operatorId }
+    );
+    RealtimeService.emitToUser(userId, {
+      type: 'deposit.unfrozen',
+      payload: {
+        amount,
+        orderId,
+        frozenDeposit: result.frozenAfter,
+        availableDeposit: result.balanceAfter - result.frozenAfter,
+      },
+    });
     return result;
   }
 
@@ -75,6 +149,14 @@ class TransactionService {
       '租赁费用扣除',
       { order: orderId }
     );
+    RealtimeService.emitToUser(userId, {
+      type: 'payment.rental.deducted',
+      payload: {
+      amount,
+      orderId,
+      balance: result.balanceAfter,
+      },
+    });
     return result;
   }
 
@@ -87,6 +169,14 @@ class TransactionService {
       '逾期费用扣除',
       { order: orderId }
     );
+    RealtimeService.emitToUser(userId, {
+      type: 'payment.overdue.deducted',
+      payload: {
+      amount,
+      orderId,
+      balance: result.balanceAfter,
+      },
+    });
     return result;
   }
 
@@ -103,6 +193,15 @@ class TransactionService {
         operator: operatorId,
       }
     );
+    RealtimeService.emitToUser(userId, {
+      type: 'payment.compensation.deducted',
+      payload: {
+      amount,
+      orderId,
+      damageReportId,
+      balance: result.balanceAfter,
+      },
+    });
     return result;
   }
 
@@ -115,6 +214,14 @@ class TransactionService {
       reason,
       { order: orderId }
     );
+    RealtimeService.emitToUser(userId, {
+      type: 'deposit.refunded',
+      payload: {
+      amount,
+      orderId,
+      balance: result.balanceAfter,
+      },
+    });
     return result;
   }
 

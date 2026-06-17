@@ -57,11 +57,20 @@ const userSchema = new mongoose.Schema({
     default: 0,
     min: 0,
   },
+  frozenDeposit: {
+    type: Number,
+    default: 0,
+    min: 0,
+  },
   consecutiveOverdue: {
     type: Number,
     default: 0,
     min: 0,
   },
+  overdueOrderIds: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'RentalOrder',
+  }],
   isRentalRestricted: {
     type: Boolean,
     default: false,
@@ -89,6 +98,10 @@ userSchema.pre('save', async function (next) {
   next();
 });
 
+userSchema.virtual('availableDeposit').get(function () {
+  return Math.max(0, (this.depositBalance || 0) - (this.frozenDeposit || 0));
+});
+
 userSchema.methods.matchPassword = async function (enteredPassword) {
   return await bcrypt.compare(enteredPassword, this.password);
 };
@@ -105,22 +118,76 @@ userSchema.methods.updateCreditScore = async function (delta, reason) {
   return { oldScore, newScore: this.creditScore, delta, reason };
 };
 
-userSchema.methods.recordOverdue = async function () {
-  this.consecutiveOverdue += 1;
+userSchema.methods.freezeDeposit = async function (amount, orderId = null) {
+  if (amount <= 0) return { success: true, message: '无需冻结' };
+  const available = (this.depositBalance || 0) - (this.frozenDeposit || 0);
+  if (available < amount) {
+    return { success: false, message: `可用押金不足（可用¥${available}，需冻结¥${amount}）` };
+  }
+  this.frozenDeposit = (this.frozenDeposit || 0) + amount;
+  await this.save();
+  return { success: true, frozen: amount, newFrozenDeposit: this.frozenDeposit };
+};
+
+userSchema.methods.unfreezeDeposit = async function (amount, orderId = null) {
+  if (amount <= 0) return { success: true, message: '无需释放' };
+  const actual = Math.min(this.frozenDeposit || 0, amount);
+  this.frozenDeposit = (this.frozenDeposit || 0) - actual;
+  if (this.frozenDeposit < 0) this.frozenDeposit = 0;
+  await this.save();
+  return { success: true, unfrozen: actual, newFrozenDeposit: this.frozenDeposit };
+};
+
+userSchema.methods.deductFrozenDeposit = async function (amount) {
+  if (amount <= 0) return { success: true };
+  const fromFrozen = Math.min(this.frozenDeposit || 0, amount);
+  const remaining = amount - fromFrozen;
+  this.frozenDeposit = (this.frozenDeposit || 0) - fromFrozen;
+  if (this.frozenDeposit < 0) this.frozenDeposit = 0;
+  if (remaining > 0) {
+    const fromBalance = Math.min(this.depositBalance || 0, remaining);
+    this.depositBalance = (this.depositBalance || 0) - fromBalance;
+    if (this.depositBalance < 0) this.depositBalance = 0;
+  } else {
+    this.depositBalance = (this.depositBalance || 0) - fromFrozen;
+    if (this.depositBalance < 0) this.depositBalance = 0;
+  }
+  await this.save();
+  return { success: true, deductedFromFrozen: fromFrozen, deductedFromBalance: remaining > 0 ? amount - fromFrozen : 0 };
+};
+
+userSchema.methods.recordOverdue = async function (orderId = null) {
+  if (orderId) {
+    const oid = orderId.toString ? orderId.toString() : String(orderId);
+    if (!this.overdueOrderIds) this.overdueOrderIds = [];
+    if (!this.overdueOrderIds.map(id => id.toString()).includes(oid)) {
+      this.overdueOrderIds.push(orderId);
+      this.consecutiveOverdue = (this.consecutiveOverdue || 0) + 1;
+    }
+  } else {
+    this.consecutiveOverdue = (this.consecutiveOverdue || 0) + 1;
+  }
   await this.updateCreditScore(-10, '逾期归还');
   
   const limit = parseInt(process.env.OVERDUE_CONSECUTIVE_LIMIT) || 2;
-  if (this.consecutiveOverdue >= limit) {
+  let restricted = this.isRentalRestricted;
+  if (this.consecutiveOverdue >= limit && !this.isRentalRestricted) {
     this.isRentalRestricted = true;
     this.restrictionEndDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    restricted = true;
   }
   
   await this.save();
-  return this.isRentalRestricted;
+  return { restricted, consecutiveOverdue: this.consecutiveOverdue };
+};
+
+userSchema.methods.recordOverdueImmediate = async function (orderId = null) {
+  return await this.recordOverdue(orderId);
 };
 
 userSchema.methods.clearOverdueStreak = async function () {
   this.consecutiveOverdue = 0;
+  this.overdueOrderIds = [];
   await this.save();
 };
 
@@ -134,8 +201,9 @@ userSchema.methods.canRent = function (requiredDeposit = 0) {
   if (this.creditScore < (parseInt(process.env.MIN_CREDIT_SCORE) || 60)) {
     return { allowed: false, reason: `信用分不足（当前${this.creditScore}分，需${process.env.MIN_CREDIT_SCORE || 60}分）` };
   }
-  if (this.depositBalance < requiredDeposit) {
-    return { allowed: false, reason: `押金余额不足（当前¥${this.depositBalance}，需¥${requiredDeposit}）` };
+  const available = (this.depositBalance || 0) - (this.frozenDeposit || 0);
+  if (available < requiredDeposit) {
+    return { allowed: false, reason: `可用押金不足（当前¥${available}，需¥${requiredDeposit}）` };
   }
   return { allowed: true };
 };

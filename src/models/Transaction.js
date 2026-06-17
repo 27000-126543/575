@@ -26,7 +26,7 @@ const transactionSchema = new mongoose.Schema({
   },
   direction: {
     type: String,
-    enum: ['in', 'out'],
+    enum: ['in', 'out', 'freeze', 'unfreeze'],
     required: true,
   },
   balanceBefore: {
@@ -34,6 +34,14 @@ const transactionSchema = new mongoose.Schema({
     default: 0,
   },
   balanceAfter: {
+    type: Number,
+    default: 0,
+  },
+  frozenBefore: {
+    type: Number,
+    default: 0,
+  },
+  frozenAfter: {
     type: Number,
     default: 0,
   },

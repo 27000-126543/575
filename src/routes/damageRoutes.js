@@ -11,6 +11,7 @@ router.get('/', auth, damageController.list);
 router.get('/:id', auth, damageController.getById);
 
 router.put('/:id/review', auth, adminOnly, damageController.review);
+router.put('/:id/pay', auth, damageController.pay);
 router.put('/:id/compensation', auth, adminOnly, damageController.updateCompensation);
 router.put('/:id/start-review', auth, adminOnly, damageController.startReview);
 

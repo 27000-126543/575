@@ -11,6 +11,7 @@ const {
 const { DAMAGE_STATUS, USER_ROLE, ORDER_STATUS } = require('../config/constants');
 const TransactionService = require('../services/transactionService');
 const NotificationService = require('../services/notificationService');
+const RealtimeService = require('../services/realtimeService');
 
 const damageController = {
   list: asyncHandler(async (req, res) => {
@@ -78,9 +79,11 @@ const damageController = {
       throw new NotFoundError('损坏工单不存在');
     }
 
-    if (![DAMAGE_STATUS.PENDING, DAMAGE_STATUS.UNDER_REVIEW, DAMAGE_STATUS.ESCALATED].includes(report.status)) {
+    if (![DAMAGE_STATUS.PENDING, DAMAGE_STATUS.UNDER_REVIEW, DAMAGE_STATUS.ESCALATED, DAMAGE_STATUS.PENDING_PAYMENT, DAMAGE_STATUS.PAYMENT_FAILED].includes(report.status)) {
       throw new BadRequestError(`当前工单状态不允许审核（状态：${report.status}）`);
     }
+
+    let paymentInfo = { paid: false, failed: false, message: '' };
 
     await withTransaction(async ({ session, useTransaction }) => {
       const sessionOpt = useTransaction ? session : null;
@@ -97,19 +100,29 @@ const damageController = {
             req.userId
           );
           await report.markCompensated(txnResult.transaction._id);
+          paymentInfo = { paid: true, failed: false, message: '赔偿扣款成功', transactionId: txnResult.transaction._id };
         } catch (txnError) {
-          console.warn('赔偿扣款失败:', txnError.message);
+          console.warn('赔偿扣款失败，保留待支付状态:', txnError.message);
+          await report.markPaymentFailed(txnError.message || '扣款失败', req.userId);
+          paymentInfo = {
+            paid: false,
+            failed: true,
+            message: `赔偿扣款失败：${txnError.message}，用户需补足余额后重试`,
+            error: txnError.message,
+          };
         }
 
         try {
           const user = useTransaction ? await User.findById(report.user).session(session) : await User.findById(report.user);
-          const creditResult = await user.updateCreditScore(-15, '损坏物品赔偿');
-          await NotificationService.creditUpdate(
-            user._id,
-            creditResult.delta,
-            creditResult.newScore,
-            creditResult.reason
-          );
+          if (user) {
+            const creditResult = await user.updateCreditScore(-15, '损坏物品赔偿');
+            await NotificationService.creditUpdate(
+              user._id,
+              creditResult.delta,
+              creditResult.newScore,
+              creditResult.reason
+            );
+          }
         } catch (creditError) {
           console.warn('信用分扣除失败:', creditError.message);
         }
@@ -119,7 +132,7 @@ const damageController = {
           if (order) {
             order.damageDetected = true;
             order.damageReport = report._id;
-            if (order.status !== ORDER_STATUS.COMPLETED) {
+            if (order.status !== ORDER_STATUS.COMPLETED && paymentInfo.paid) {
               await order.updateStatus(ORDER_STATUS.COMPLETED, req.userId, '损坏赔偿处理完成，订单结束');
             }
             await sessionSave(order, sessionOpt);
@@ -128,16 +141,35 @@ const damageController = {
           console.warn('订单状态更新失败:', orderError.message);
         }
 
-        try {
-          await TransactionService.refundDeposit(
-            report.user,
-            0,
-            report.order,
-            '损坏赔偿已处理'
-          );
-        } catch (e) {}
+        if (paymentInfo.paid) {
+          try {
+            await TransactionService.unfreezeDeposit(
+              report.user,
+              0,
+              report.order,
+              '损坏赔偿已完成'
+            );
+          } catch (e) {}
+        }
 
         await NotificationService.damageReviewed(report, true, notes);
+        RealtimeService.broadcastDamageEvent(report, 'reviewed', {
+          approved: true,
+          totalCompensation: report.totalCompensation,
+          payment: paymentInfo,
+        });
+
+        if (paymentInfo.failed) {
+          await NotificationService.compensationFailed(report, paymentInfo.error, paymentInfo.message);
+          RealtimeService.broadcastDamageEvent(report, 'payment_failed', {
+            error: paymentInfo.error,
+            totalCompensation: report.totalCompensation,
+          });
+        } else if (paymentInfo.paid) {
+          RealtimeService.broadcastDamageEvent(report, 'compensated', {
+            transactionId: paymentInfo.transactionId,
+          });
+        }
       } else {
         await report.reject(req.userId, notes);
 
@@ -147,30 +179,105 @@ const damageController = {
             order.damageDetected = false;
             await order.updateStatus(ORDER_STATUS.COMPLETED, req.userId, '审核无损坏，订单完成');
           }
-          await TransactionService.refundDeposit(
-            report.user,
-            order ? order.depositRequired : 0,
-            report.order,
-            '审核无损坏，退还押金'
-          );
+          if (order && order.depositFrozen && order.depositRequired > 0) {
+            await TransactionService.unfreezeDeposit(
+              report.user,
+              order.depositRequired,
+              report.order,
+              '审核无损坏，释放冻结押金'
+            );
+          }
         } catch (e) {
-          console.warn('押金退还失败:', e.message);
+          console.warn('押金释放失败:', e.message);
         }
 
         await NotificationService.damageReviewed(report, false, notes);
+        RealtimeService.broadcastDamageEvent(report, 'reviewed', { approved: false });
       }
     });
 
     const updated = await DamageReport.findById(req.params.id)
       .populate('compensationTransaction');
 
+    let message;
+    if (approve) {
+      if (paymentInfo.paid) {
+        message = `审核通过，赔偿金额¥${report.totalCompensation}已处理`;
+      } else {
+        message = `审核通过，但赔偿扣款失败（${paymentInfo.error}）。状态已保留为${updated.status}，用户补足余额后可继续完成赔偿`;
+      }
+    } else {
+      message = '审核拒绝，无需赔偿';
+    }
+
     successResponse(res, {
       report: updated,
       approved: approve,
-      message: approve
-        ? `审核通过，赔偿金额¥${report.totalCompensation}已处理`
-        : '审核拒绝，无需赔偿',
-    });
+      payment: paymentInfo,
+      message,
+    }, message, paymentInfo.failed ? 202 : 200);
+  }),
+
+  pay: asyncHandler(async (req, res) => {
+    const report = await DamageReport.findById(req.params.id);
+    if (!report) {
+      throw new NotFoundError('损坏工单不存在');
+    }
+    if (report.status !== DAMAGE_STATUS.PENDING_PAYMENT && report.status !== DAMAGE_STATUS.PAYMENT_FAILED) {
+      throw new BadRequestError(`当前工单状态不允许支付（状态：${report.status}）`);
+    }
+    if (req.user.role !== USER_ROLE.ADMIN && report.user.toString() !== req.userId.toString()) {
+      throw new ForbiddenError('无权操作此工单');
+    }
+
+    let paymentInfo = { paid: false, failed: false, message: '' };
+
+    try {
+      await report.markPendingPayment(req.userId, '用户/管理员主动发起赔偿扣款');
+      const txnResult = await TransactionService.deductCompensation(
+        report.user,
+        report.totalCompensation,
+        report.order,
+        report._id,
+        req.userId
+      );
+      await report.markCompensated(txnResult.transaction._id);
+      paymentInfo = { paid: true, failed: false, message: '赔偿扣款成功', transactionId: txnResult.transaction._id };
+
+      const { RentalOrder } = require('../models');
+      const order = await RentalOrder.findById(report.order);
+      if (order && order.status !== ORDER_STATUS.COMPLETED) {
+        await order.updateStatus(ORDER_STATUS.COMPLETED, req.userId, '赔偿扣款完成，订单结束');
+      }
+
+      await NotificationService.payment(report, report.totalCompensation, '赔偿已完成扣款');
+      RealtimeService.broadcastDamageEvent(report, 'compensated', {
+        transactionId: txnResult.transaction._id,
+      });
+    } catch (txnError) {
+      console.warn('赔偿扣款重试失败:', txnError.message);
+      await report.markPaymentFailed(txnError.message || '扣款失败', req.userId);
+      paymentInfo = {
+        paid: false,
+        failed: true,
+        message: `赔偿扣款失败：${txnError.message}，请补足余额后重试`,
+        error: txnError.message,
+      };
+      await NotificationService.compensationFailed(report, txnError.message, paymentInfo.message);
+      RealtimeService.broadcastDamageEvent(report, 'payment_failed', {
+        error: txnError.message,
+        totalCompensation: report.totalCompensation,
+      });
+    }
+
+    const updated = await DamageReport.findById(req.params.id)
+      .populate('compensationTransaction');
+
+    successResponse(res, {
+      report: updated,
+      payment: paymentInfo,
+      message: paymentInfo.message,
+    }, paymentInfo.message, paymentInfo.failed ? 202 : 200);
   }),
 
   updateCompensation: asyncHandler(async (req, res) => {

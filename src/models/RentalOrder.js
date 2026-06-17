@@ -60,6 +60,14 @@ const orderSchema = new mongoose.Schema({
     type: Boolean,
     default: false,
   },
+  depositFrozen: {
+    type: Boolean,
+    default: false,
+  },
+  overdueCounted: {
+    type: Boolean,
+    default: false,
+  },
   overdueHours: {
     type: Number,
     default: 0,

@@ -12,6 +12,7 @@ const {
 const { ORDER_STATUS, DAMAGE_STATUS, USER_ROLE } = require('../config/constants');
 const TransactionService = require('../services/transactionService');
 const NotificationService = require('../services/notificationService');
+const RealtimeService = require('../services/realtimeService');
 
 const orderController = {
   create: asyncHandler(async (req, res) => {
@@ -89,6 +90,18 @@ const orderController = {
 
       await tool.lockStock(quantity);
 
+      try {
+        await TransactionService.freezeDeposit(
+          req.userId,
+          totalDeposit,
+          null,
+          null
+        );
+      } catch (freezeErr) {
+        await tool.unlockStock(quantity);
+        throw new BadRequestError(`押金冻结失败: ${freezeErr.message}`);
+      }
+
       const orderData = {
         orderNo: generateOrderNo(),
         user: req.userId,
@@ -102,18 +115,31 @@ const orderController = {
           subtotal: p.subtotal * quantity,
         })),
         depositRequired: totalDeposit,
-        depositPaid: true,
+        depositFrozen: true,
         totalAmount: totalRent,
         status: ORDER_STATUS.APPROVED,
         notes,
       };
       const order = await sessionCreate(RentalOrder, orderData, sessionOpt);
 
+      try {
+        const { Transaction } = require('../models');
+        await Transaction.findOneAndUpdate(
+          { user: req.userId, type: 'deposit_freeze', order: null },
+          { order: order._id },
+          { sort: { createdAt: -1 } }
+        );
+      } catch (_) {}
+
       await NotificationService.orderStatus(order, '申请通过', {
         data: {
           rentalFee: totalRent,
           deposit: totalDeposit,
         },
+      });
+      RealtimeService.broadcastOrderEvent(order, 'approved', {
+        rentalFee: totalRent,
+        deposit: totalDeposit,
       });
 
       return {
@@ -124,6 +150,7 @@ const orderController = {
     });
 
     if (result.type === 'rejected') {
+      RealtimeService.broadcastOrderEvent(result.order, 'rejected', { reason: result.reason });
       return successResponse(res, {
         order: result.order,
         rejected: true,
@@ -230,6 +257,9 @@ const orderController = {
       await NotificationService.orderStatus(order, '用户已取用', {
         data: { actualStartTime: order.actualStartTime },
       });
+      RealtimeService.broadcastOrderEvent(order, 'picked_up', {
+        actualStartTime: order.actualStartTime,
+      });
 
       return { txnResult };
     });
@@ -268,9 +298,16 @@ const orderController = {
 
       if (order.hasBeenOverdue && order.overdueFee > 0) {
         const user = useTransaction ? await User.findById(order.user).session(session) : await User.findById(order.user);
-        const restricted = await user.recordOverdue();
-        if (restricted) {
-          await NotificationService.rentalRestricted(user._id, user.consecutiveOverdue);
+        const overdueResult = await user.recordOverdue(order._id);
+        if (overdueResult.restricted) {
+          await NotificationService.rentalRestricted(user._id, overdueResult.consecutiveOverdue);
+          RealtimeService.emitToUser(user._id, {
+            type: 'user.restricted',
+            payload: {
+              consecutiveOverdue: overdueResult.consecutiveOverdue,
+              restrictionEndDate: user.restrictionEndDate,
+            },
+          });
         }
 
         try {
@@ -325,19 +362,23 @@ const orderController = {
         await tool.recordDamage();
 
         await NotificationService.damageCreated(damageReport);
+        RealtimeService.broadcastDamageEvent(damageReport, 'created');
       } else {
         await order.complete();
-        try {
-          await TransactionService.refundDeposit(
-            order.user,
-            order.depositRequired,
-            order._id,
-            '订单完成，退还押金'
-          );
-        } catch (txnError) {
-          console.warn('押金退还失败:', txnError.message);
+        if (order.depositFrozen && order.depositRequired > 0) {
+          try {
+            await TransactionService.unfreezeDeposit(
+              order.user,
+              order.depositRequired,
+              order._id,
+              '订单无损坏完成，释放冻结押金'
+            );
+          } catch (txnError) {
+            console.warn('押金释放失败:', txnError.message);
+          }
         }
         await NotificationService.orderStatus(order, '已完成');
+        RealtimeService.broadcastOrderEvent(order, 'completed');
       }
 
       return { damageReport, comparison };
@@ -376,8 +417,22 @@ const orderController = {
         await tool.unlockStock(order.quantity);
       }
 
+      if (order.depositFrozen && order.depositRequired > 0) {
+        try {
+          await TransactionService.unfreezeDeposit(
+            order.user,
+            order.depositRequired,
+            order._id,
+            '取消订单，释放冻结押金'
+          );
+        } catch (freezeErr) {
+          console.warn('取消订单时押金释放失败:', freezeErr.message);
+        }
+      }
+
       await order.updateStatus(ORDER_STATUS.CANCELLED, req.userId, '用户取消订单');
       await NotificationService.orderStatus(order, '已取消');
+      RealtimeService.broadcastOrderEvent(order, 'cancelled');
     });
 
     successResponse(res, { order }, '订单已取消');

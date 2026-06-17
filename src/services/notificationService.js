@@ -200,6 +200,38 @@ class NotificationService {
       { report: report._id, level: 'success' }
     );
   }
+
+  static async compensationFailed(damageReport, failReason, fullMessage = '') {
+    const userTitle = '赔偿扣款失败';
+    const userContent = fullMessage
+      || `工单 ${damageReport.reportNo} 赔偿扣款失败（${failReason}），请补足押金余额后重试或联系客服。`;
+    await this.create(
+      damageReport.user,
+      NOTIFICATION_TYPE.COMPENSATION_FAILED,
+      userTitle,
+      userContent,
+      {
+        damageReport: damageReport._id,
+        order: damageReport.order,
+        level: 'error',
+        data: { failReason, totalCompensation: damageReport.totalCompensation },
+      }
+    );
+
+    const adminTitle = '赔偿扣款失败需处理';
+    const adminContent = `工单 ${damageReport.reportNo} 赔偿扣款失败（${failReason}），用户余额不足需补足，请跟进处理。`;
+    await this.notifyAdmins(
+      NOTIFICATION_TYPE.COMPENSATION_FAILED,
+      adminTitle,
+      adminContent,
+      {
+        damageReport: damageReport._id,
+        order: damageReport.order,
+        level: 'error',
+        data: { failReason, totalCompensation: damageReport.totalCompensation },
+      }
+    );
+  }
 }
 
 module.exports = NotificationService;

@@ -105,6 +105,18 @@ const damageReportSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Transaction',
   },
+  paymentFailedReason: {
+    type: String,
+    trim: true,
+  },
+  lastPaymentAttemptAt: {
+    type: Date,
+  },
+  paymentAttempts: {
+    type: Number,
+    default: 0,
+    min: 0,
+  },
   remindersSent: {
     type: Number,
     default: 0,
@@ -204,6 +216,25 @@ damageReportSchema.methods.markCompensated = async function (transactionId) {
   this.compensationTransaction = transactionId;
   await this.updateStatus(DAMAGE_STATUS.COMPENSATED, null, '赔偿已完成扣款');
   return this;
+};
+
+damageReportSchema.methods.markPendingPayment = async function (operatorId = null, remark = '等待支付赔偿') {
+  this.lastPaymentAttemptAt = new Date();
+  this.paymentAttempts = (this.paymentAttempts || 0) + 1;
+  await this.updateStatus(DAMAGE_STATUS.PENDING_PAYMENT, operatorId, remark);
+  return this;
+};
+
+damageReportSchema.methods.markPaymentFailed = async function (reason, operatorId = null) {
+  this.paymentFailedReason = reason || '扣款失败';
+  this.lastPaymentAttemptAt = new Date();
+  this.paymentAttempts = (this.paymentAttempts || 0) + 1;
+  await this.updateStatus(DAMAGE_STATUS.PAYMENT_FAILED, operatorId, `赔偿扣款失败：${reason || '未知原因'}`);
+  return this;
+};
+
+damageReportSchema.methods.retryCompensation = async function () {
+  return this.markPendingPayment(null, '用户补足余额，重试赔偿扣款');
 };
 
 damageReportSchema.index({ status: 1, createdAt: 1 });

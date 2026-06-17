@@ -17,6 +17,8 @@ const DAMAGE_STATUS = {
   REJECTED: 'rejected',
   COMPENSATED: 'compensated',
   ESCALATED: 'escalated',
+  PENDING_PAYMENT: 'pending_payment',
+  PAYMENT_FAILED: 'payment_failed',
 };
 
 const NOTIFICATION_TYPE = {
@@ -27,6 +29,11 @@ const NOTIFICATION_TYPE = {
   ADMIN_ALERT: 'admin_alert',
   CREDIT_UPDATE: 'credit_update',
   REPORT_READY: 'report_ready',
+  DEPOSIT_FREEZE: 'deposit_freeze',
+  DEPOSIT_UNFREEZE: 'deposit_unfreeze',
+  COMPENSATION_PENDING: 'compensation_pending',
+  COMPENSATION_FAILED: 'compensation_failed',
+  RENTAL_RESTRICTED_IMMEDIATE: 'rental_restricted_immediate',
 };
 
 const USER_ROLE = {
@@ -40,6 +47,8 @@ const TRANSACTION_TYPE = {
   OVERDUE_FEE: 'overdue_fee',
   COMPENSATION: 'compensation',
   REFUND: 'refund',
+  DEPOSIT_FREEZE: 'deposit_freeze',
+  DEPOSIT_UNFREEZE: 'deposit_unfreeze',
 };
 
 const TOOL_CATEGORY = [

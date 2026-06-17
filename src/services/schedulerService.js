@@ -6,6 +6,7 @@ const {
 const { ORDER_STATUS, DAMAGE_STATUS, USER_ROLE, TOOL_CATEGORY, REGION } = require('../config/constants');
 const NotificationService = require('./notificationService');
 const TransactionService = require('./transactionService');
+const RealtimeService = require('./realtimeService');
 
 class SchedulerService {
   static async checkOverdueOrders() {
@@ -19,6 +20,7 @@ class SchedulerService {
 
     let processed = 0;
     let newOverdue = 0;
+    let newlyRestricted = 0;
 
     for (const order of orders) {
       try {
@@ -26,9 +28,37 @@ class SchedulerService {
         const result = await order.calculateOverdue(tool, now);
 
         if (result.overdue && result.changed) {
-          if (order.status !== ORDER_STATUS.OVERDUE || result.overdueHours === 1) {
+          const isNewlyOverdue = order.status !== ORDER_STATUS.OVERDUE || result.overdueHours === 1;
+          if (isNewlyOverdue) {
             await NotificationService.overdue(order, result.overdueHours, result.overdueFee);
+            RealtimeService.broadcastOrderEvent(order, 'overdue', {
+              overdueHours: result.overdueHours,
+              overdueFee: result.overdueFee,
+            });
             newOverdue++;
+          }
+
+          if (order.user && !order.overdueCounted) {
+            const user = order.user instanceof mongoose.Document
+              ? order.user
+              : await User.findById(order.user);
+            if (user) {
+              const overdueResult = await user.recordOverdueImmediate(order._id);
+              order.overdueCounted = true;
+              await order.save();
+              if (overdueResult.restricted) {
+                await NotificationService.rentalRestricted(user._id, overdueResult.consecutiveOverdue);
+                RealtimeService.emitToUser(user._id, {
+                  type: 'user.restricted',
+                  payload: {
+                    consecutiveOverdue: overdueResult.consecutiveOverdue,
+                    restrictionEndDate: user.restrictionEndDate,
+                    reason: '连续逾期自动限制租赁',
+                  },
+                });
+                newlyRestricted++;
+              }
+            }
           }
 
           if (result.overdueHours > 0 && result.overdueHours % 24 === 0) {
@@ -58,8 +88,8 @@ class SchedulerService {
       }
     }
 
-    console.log(`[CRON] 逾期检查完成：处理${processed}个，新增${newOverdue}个逾期`);
-    return { processed, newOverdue };
+    console.log(`[CRON] 逾期检查完成：处理${processed}个，新增${newOverdue}个逾期，${newlyRestricted}个用户被限制`);
+    return { processed, newOverdue, newlyRestricted };
   }
 
   static async sendReturnReminders() {
@@ -114,6 +144,7 @@ class SchedulerService {
           }
           if (!report.lastReminderAt || (Date.now() - report.lastReminderAt.getTime() > timeoutMs)) {
             await NotificationService.damageReminder(report);
+            RealtimeService.broadcastDamageEvent(report, 'reminder', { escalationLevel: report.escalationLevel });
             report.remindersSent += 1;
             report.lastReminderAt = new Date();
             await report.save();
@@ -268,14 +299,34 @@ class SchedulerService {
       }
     }
 
-    for (const catStat of report.categoryStats) {
-      const regionTool = allTools.find(t => t.category === catStat.category);
-      if (regionTool) {
-        const regionStat = report.regionStats.find(r => r.region === regionTool.region);
+    for (const order of completedToday) {
+      if (order.tool && order.tool.region) {
+        const regionStat = report.regionStats.find(r => r.region === order.tool.region);
         if (regionStat) {
-          regionStat.rentalCount += catStat.rentalCount;
-          regionStat.revenue += catStat.revenue;
-          regionStat.damageCount += catStat.damageCount;
+          regionStat.returnedCount += 1;
+          regionStat.revenue += (order.rentalFee || 0) + (order.overdueFee || 0);
+          if (order.hasBeenOverdue) regionStat.overdueCount += 1;
+        }
+      }
+    }
+
+    for (const order of dayOrders) {
+      if (order.tool && order.tool.region) {
+        const regionStat = report.regionStats.find(r => r.region === order.tool.region);
+        if (regionStat) {
+          regionStat.rentalCount += 1;
+        }
+      }
+    }
+
+    for (const dr of damageReports) {
+      if (dr.tool && dr.tool.region) {
+        const regionStat = report.regionStats.find(r => r.region === dr.tool.region);
+        if (regionStat) {
+          regionStat.damageCount += 1;
+          if (dr.status === DAMAGE_STATUS.APPROVED || dr.status === DAMAGE_STATUS.COMPENSATED) {
+            regionStat.revenue += dr.totalCompensation || 0;
+          }
         }
       }
     }
@@ -305,6 +356,14 @@ class SchedulerService {
     await report.save();
 
     await NotificationService.reportReady(report);
+    RealtimeService.emitToAdmins({
+      type: 'report.ready',
+      payload: {
+        reportId: report._id,
+        reportDate: report.reportDate,
+        totalRevenue: report.totalRevenue,
+      },
+    });
 
     console.log(`[CRON] 经营报表生成完成：当日营收¥${report.totalRevenue.toFixed(2)}`);
     return report;

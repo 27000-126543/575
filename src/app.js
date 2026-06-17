@@ -5,11 +5,14 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const path = require('path');
 const fs = require('fs');
+const mongoose = require('mongoose');
+const http = require('http');
 
 const connectDB = require('./config/db');
 const { errorHandler, notFoundHandler } = require('./middleware/errorHandler');
 const { successResponse } = require('./utils/response');
 const SchedulerService = require('./services/schedulerService');
+const RealtimeService = require('./services/realtimeService');
 
 const userRoutes = require('./routes/userRoutes');
 const toolRoutes = require('./routes/toolRoutes');
@@ -91,6 +94,10 @@ app.get('/', (req, res) => {
         'GET /api/damages': '损坏工单列表',
         'GET /api/damages/:id': '工单详情',
         'PUT /api/damages/:id/review': '审核工单',
+        'PUT /api/damages/:id/pay': '支付/重试赔偿扣款',
+      },
+      realtime: {
+        'WS /ws': 'WebSocket实时消息通道（通过Query或Header传token）',
       },
       reports: {
         'GET /api/reports/dashboard': '经营仪表盘',
@@ -119,14 +126,21 @@ process.on('unhandledRejection', (err) => {
   console.error('未处理的Promise拒绝:', err);
 });
 
-const mongoose = require('mongoose');
-
 connectDB().then(() => {
-  app.listen(PORT, () => {
+  const server = http.createServer(app);
+
+  try {
+    RealtimeService.init(server);
+  } catch (rtErr) {
+    console.warn('WebSocket服务启动警告:', rtErr.message);
+  }
+
+  server.listen(PORT, () => {
     console.log('========================================');
     console.log(`🚀 服务启动成功`);
     console.log(`📡 端口: ${PORT}`);
     console.log(`🌍 URL: http://localhost:${PORT}`);
+    console.log(`📡 WebSocket: ws://localhost:${PORT}/ws`);
     console.log(`📚 API文档: http://localhost:${PORT}/`);
     console.log(`💊 健康检查: http://localhost:${PORT}/health`);
     console.log('========================================');
