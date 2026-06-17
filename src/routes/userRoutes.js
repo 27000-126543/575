@@ -24,5 +24,6 @@ router.get('/', auth, adminOnly, userController.getAllUsers);
 router.get('/:id', auth, adminOnly, userController.getUserById);
 router.put('/:id/status', auth, adminOnly, userController.updateUserStatus);
 router.put('/:id/credit-score', auth, adminOnly, userController.adjustCreditScore);
+router.put('/:id/restrict', auth, adminOnly, userController.setRentalRestriction);
 
 module.exports = router;

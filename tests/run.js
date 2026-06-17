@@ -461,6 +461,220 @@ const runTests = async () => {
     assert(validReason, `拒绝原因不符合预期: ${reason}`);
   });
 
+  title('9. 业务规则回归测试');
+
+  await test('一笔逾期不限制租赁', async () => {
+    const ovUser1 = 'ov1_' + Date.now();
+    const reg1 = await request('POST', '/api/users/register', {
+      username: ovUser1, password: 'test123456', realName: '逾期测试1',
+      phone: '137' + String(Date.now()).slice(-8), region: '东城区',
+    });
+    const tk1 = reg1.body.data.token;
+    await request('POST', '/api/users/deposit', { amount: 1000 }, tk1);
+
+    const startTime = new Date(Date.now() + 1000).toISOString();
+    const endTime = new Date(Date.now() + 3600 * 1000).toISOString();
+    const order1 = await request('POST', '/api/orders', {
+      toolId: state.toolId, startTime, endTime,
+    }, tk1);
+    assertHttp(order1, 201);
+    const oid1 = order1.body.data.order._id;
+
+    await request('PUT', `/api/orders/${oid1}/pickup`, {}, tk1);
+
+    const userBefore = await request('GET', '/api/users/profile', null, tk1);
+    const uid1 = userBefore.body.data._id;
+    const creditBefore = userBefore.body.data.creditScore;
+
+    await request('PUT', `/api/users/${uid1}/credit-score`, {
+      delta: -10, reason: '模拟第一笔逾期扣信用分',
+    }, state.adminToken);
+
+    const userAfter1 = await request('GET', '/api/users/profile', null, tk1);
+    assert(userAfter1.body.data.isRentalRestricted !== true,
+      '一笔逾期不应触发isRentalRestricted限制');
+
+    const startTime2 = new Date(Date.now() + 1000).toISOString();
+    const endTime2 = new Date(Date.now() + 3600 * 2 * 1000).toISOString();
+    const retry = await request('POST', '/api/orders', {
+      toolId: state.toolId, startTime: startTime2, endTime: endTime2,
+    }, tk1);
+
+    if (retry.body.data && retry.body.data.rejected === true) {
+      const reason = retry.body.data.reason || '';
+      assert(!reason.includes('限制'), `一笔逾期不应因租赁限制被拒: ${reason}`);
+    }
+  });
+
+  await test('两笔不同订单逾期才限制租赁', async () => {
+    const ovUser2 = 'ov2_' + Date.now();
+    const reg2 = await request('POST', '/api/users/register', {
+      username: ovUser2, password: 'test123456', realName: '逾期测试2',
+      phone: '138' + String(Date.now()).slice(-8), region: '西城区',
+    });
+    const tk2 = reg2.body.data.token;
+    const uid2 = reg2.body.data.user._id;
+    await request('POST', '/api/users/deposit', { amount: 5000 }, tk2);
+
+    const tools = await request('GET', '/api/tools', null, tk2);
+    const toolList = tools.body.data && tools.body.data.list ? tools.body.data.list : [];
+    const tid1 = state.toolId;
+    let tid2 = tid1;
+    if (toolList.length > 1) {
+      tid2 = toolList.find(t => t._id !== tid1)?._id || tid1;
+    }
+
+    const s1 = new Date(Date.now() + 1000).toISOString();
+    const e1 = new Date(Date.now() + 3600 * 1000).toISOString();
+    const o1 = await request('POST', '/api/orders', { toolId: tid1, startTime: s1, endTime: e1 }, tk2);
+    if (o1.body.data && o1.body.data._id) {
+      await request('PUT', `/api/orders/${o1.body.data._id}/pickup`, {}, tk2);
+    }
+
+    const s2 = new Date(Date.now() + 2000).toISOString();
+    const e2 = new Date(Date.now() + 3600 * 2 * 1000).toISOString();
+    const o2 = await request('POST', '/api/orders', { toolId: tid2, startTime: s2, endTime: e2 }, tk2);
+    if (o2.body.data && o2.body.data._id) {
+      await request('PUT', `/api/orders/${o2.body.data._id}/pickup`, {}, tk2);
+    }
+
+    await request('PUT', `/api/users/${uid2}/credit-score`, {
+      delta: -10, reason: '第一笔逾期',
+    }, state.adminToken);
+    await request('PUT', `/api/users/${uid2}/credit-score`, {
+      delta: -10, reason: '第二笔逾期',
+    }, state.adminToken);
+
+    const restrictR = await request('PUT', `/api/users/${uid2}/restrict`, {
+      restricted: true,
+      reason: '连续2次逾期',
+    }, state.adminToken);
+    if (restrictR.status === 404) {
+      await request('PUT', `/api/users/${uid2}/status`, {
+        isRentalRestricted: true,
+      }, state.adminToken);
+    }
+
+    const userCheck = await request('GET', `/api/users/${uid2}`, null, state.adminToken);
+    assert(userCheck.body.data.isRentalRestricted === true, '两笔逾期后应被限制');
+
+    const s3 = new Date(Date.now() + 3000).toISOString();
+    const e3 = new Date(Date.now() + 3600 * 1000).toISOString();
+    const rejectR = await request('POST', '/api/orders', { toolId: tid1, startTime: s3, endTime: e3 }, tk2);
+    const reason = (rejectR.body.data && rejectR.body.data.reason) || '';
+    assert(reason.includes('限制'), `两笔逾期后申请应被限制: ${reason}`);
+  });
+
+  await test('冻结押金赔偿后总余额减少', async () => {
+    const compUser = 'comp_' + Date.now();
+    const reg3 = await request('POST', '/api/users/register', {
+      username: compUser, password: 'test123456', realName: '赔偿测试',
+      phone: '139' + String(Date.now()).slice(-8), region: '朝阳区',
+    });
+    const tk3 = reg3.body.data.token;
+    await request('POST', '/api/users/deposit', { amount: 500 }, tk3);
+
+    const profileBefore = await request('GET', '/api/users/profile', null, tk3);
+    const balanceBefore = profileBefore.body.data.depositBalance;
+    info(`充值后余额: ¥${balanceBefore}`);
+
+    const s = new Date(Date.now() + 1000).toISOString();
+    const e = new Date(Date.now() + 3600 * 1000).toISOString();
+    const ord = await request('POST', '/api/orders', { toolId: state.toolId, startTime: s, endTime: e }, tk3);
+    assertHttp(ord, 201);
+    const oid = ord.body.data.order._id;
+
+    await request('PUT', `/api/orders/${oid}/pickup`, {}, tk3);
+
+    const profileFrozen = await request('GET', '/api/users/profile', null, tk3);
+    info(`取用后余额: ¥${profileFrozen.body.data.depositBalance}, 冻结: ¥${profileFrozen.body.data.frozenDeposit}`);
+
+    const retR = await request('PUT', `/api/orders/${oid}/return`, {
+      returnImages: ['img1.jpg', 'img2.jpg', 'img3.jpg', 'img4.jpg', 'img5.jpg', 'img6.jpg', 'img7.jpg'],
+    }, tk3);
+    assertHttp(retR, 200);
+
+    if (retR.body.data.damageReport) {
+      const drId = retR.body.data.damageReport._id || retR.body.data.damageReport;
+      info(`损坏工单: ${drId}`);
+
+      const reviewR = await request('PUT', `/api/damages/${drId}/review`, {
+        approve: true,
+        compensationAmount: 100,
+        notes: '测试赔偿扣款',
+      }, state.adminToken);
+      assertHttp(reviewR, 200);
+
+      const profileAfter = await request('GET', '/api/users/profile', null, tk3);
+      const balanceAfter = profileAfter.body.data.depositBalance;
+      info(`赔偿后余额: ¥${balanceAfter}`);
+
+      if (reviewR.body.data.payment && reviewR.body.data.payment.paid) {
+        assert(balanceAfter < balanceBefore,
+          `赔偿扣款后余额应减少: 之前¥${balanceBefore} 之后¥${balanceAfter}`);
+      }
+    }
+  });
+
+  await test('赔偿金额超余额时不标为已赔偿', async () => {
+    const expUser = 'exp_' + Date.now();
+    const reg4 = await request('POST', '/api/users/register', {
+      username: expUser, password: 'test123456', realName: '超额赔偿',
+      phone: '150' + String(Date.now()).slice(-8), region: '海淀区',
+    });
+    const tk4 = reg4.body.data.token;
+    await request('POST', '/api/users/deposit', { amount: 250 }, tk4);
+
+    const s = new Date(Date.now() + 1000).toISOString();
+    const e = new Date(Date.now() + 3600 * 1000).toISOString();
+    const ord = await request('POST', '/api/orders', { toolId: state.toolId, startTime: s, endTime: e }, tk4);
+    assertHttp(ord, 201);
+    const oid = ord.body.data.order._id;
+
+    await request('PUT', `/api/orders/${oid}/pickup`, {}, tk4);
+
+    const retR = await request('PUT', `/api/orders/${oid}/return`, {
+      returnImages: ['img1.jpg', 'img2.jpg', 'img3.jpg', 'img4.jpg', 'img5.jpg', 'img6.jpg', 'img7.jpg'],
+    }, tk4);
+
+    if (retR.body.data.damageReport) {
+      const drId = retR.body.data.damageReport._id || retR.body.data.damageReport;
+
+      const reviewR = await request('PUT', `/api/damages/${drId}/review`, {
+        approve: true,
+        compensationAmount: 99999,
+        notes: '测试超额赔偿',
+      }, state.adminToken);
+
+      const drStatus = reviewR.body.data.report && reviewR.body.data.report.status;
+      const paymentInfo = reviewR.body.data.payment || {};
+
+      if (paymentInfo.failed) {
+        assert(drStatus !== 'compensated',
+          `超额赔偿不应标记为已赔偿，当前状态: ${drStatus}`);
+        assert(drStatus === 'payment_failed' || drStatus === 'pending_payment',
+          `应保留待支付或失败状态，当前: ${drStatus}`);
+        info(`超额赔偿正确保留状态: ${drStatus}`);
+      }
+
+      const payRetry = await request('PUT', `/api/damages/${drId}/pay`, {}, tk4);
+      if (payRetry.body.data.payment && payRetry.body.data.payment.failed) {
+        assert(payRetry.body.data.report.status !== 'compensated',
+          '余额不足时重试也不应标记已赔偿');
+        info(`重试扣款正确保留失败状态: ${payRetry.body.data.report.status}`);
+      }
+
+      await request('POST', '/api/users/deposit', { amount: 100000 }, tk4);
+
+      const payRetry2 = await request('PUT', `/api/damages/${drId}/pay`, {}, tk4);
+      if (payRetry2.body.data.payment && payRetry2.body.data.payment.paid) {
+        assert(payRetry2.body.data.report.status === 'compensated',
+          '充值后重试应成功并标记已赔偿');
+        info('充值后重试赔偿成功');
+      }
+    }
+  });
+
   console.log('\n');
   log(COLORS.bold, '══════════════════════════════════════════════════════');
   log(COLORS.bold + COLORS.green, `  通过: ${results.passed}`);

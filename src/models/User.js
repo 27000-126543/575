@@ -109,11 +109,6 @@ userSchema.methods.matchPassword = async function (enteredPassword) {
 userSchema.methods.updateCreditScore = async function (delta, reason) {
   const oldScore = this.creditScore;
   this.creditScore = Math.max(0, Math.min(100, this.creditScore + delta));
-  
-  if (this.creditScore < parseInt(process.env.MIN_CREDIT_SCORE) || 60) {
-    this.isRentalRestricted = true;
-  }
-  
   await this.save();
   return { oldScore, newScore: this.creditScore, delta, reason };
 };

@@ -35,13 +35,12 @@ class TransactionService {
         balanceAfter = balanceBefore + amount;
       } else {
         if (type === TRANSACTION_TYPE.COMPENSATION) {
-          const fromFrozen = Math.min(frozenBefore, amount);
-          const remaining = amount - fromFrozen;
-          frozenAfter = frozenBefore - fromFrozen;
-          balanceAfter = balanceBefore - remaining;
-          if (balanceAfter < 0) {
-            throw new Error('押金余额不足');
+          if (balanceBefore < amount) {
+            throw new Error(`押金余额不足，无法扣除赔偿金¥${amount}（当前余额¥${balanceBefore}）`);
           }
+          const fromFrozen = Math.min(frozenBefore, amount);
+          frozenAfter = frozenBefore - fromFrozen;
+          balanceAfter = balanceBefore - amount;
         } else {
           if (balanceBefore < amount) {
             throw new Error('押金余额不足');

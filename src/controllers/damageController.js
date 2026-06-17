@@ -91,8 +91,9 @@ const damageController = {
       if (approve) {
         await report.approve(req.userId, compensationAmount, notes);
 
+        let txnResult = null;
         try {
-          const txnResult = await TransactionService.deductCompensation(
+          txnResult = await TransactionService.deductCompensation(
             report.user,
             report.totalCompensation,
             report.order,
@@ -143,13 +144,21 @@ const damageController = {
 
         if (paymentInfo.paid) {
           try {
-            await TransactionService.unfreezeDeposit(
-              report.user,
-              0,
-              report.order,
-              '损坏赔偿已完成'
-            );
-          } catch (e) {}
+            const orderForFrozen = await RentalOrder.findById(report.order);
+            if (orderForFrozen && orderForFrozen.depositFrozen && orderForFrozen.depositRequired > 0) {
+              const leftFrozen = txnResult ? (txnResult.frozenAfter || 0) : 0;
+              if (leftFrozen > 0) {
+                await TransactionService.unfreezeDeposit(
+                  report.user,
+                  leftFrozen,
+                  report.order,
+                  '赔偿完成后释放剩余冻结押金'
+                );
+              }
+            }
+          } catch (e) {
+            console.warn('释放剩余冻结押金失败:', e.message);
+          }
         }
 
         await NotificationService.damageReviewed(report, true, notes);
@@ -248,6 +257,22 @@ const damageController = {
       const order = await RentalOrder.findById(report.order);
       if (order && order.status !== ORDER_STATUS.COMPLETED) {
         await order.updateStatus(ORDER_STATUS.COMPLETED, req.userId, '赔偿扣款完成，订单结束');
+      }
+
+      if (order && order.depositFrozen && order.depositRequired > 0) {
+        const remainingFrozen = (txnResult.frozenAfter || 0);
+        if (remainingFrozen > 0) {
+          try {
+            await TransactionService.unfreezeDeposit(
+              report.user,
+              remainingFrozen,
+              report.order,
+              '赔偿完成后释放剩余冻结押金'
+            );
+          } catch (e) {
+            console.warn('释放剩余冻结押金失败:', e.message);
+          }
+        }
       }
 
       await NotificationService.payment(report, report.totalCompensation, '赔偿已完成扣款');

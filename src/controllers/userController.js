@@ -240,6 +240,35 @@ const userController = {
     }, `信用分已${delta > 0 ? '增加' : '扣除'}${Math.abs(delta)}分`);
   }),
 
+  setRentalRestriction: asyncHandler(async (req, res) => {
+    const { restricted, days = 30, reason = '' } = req.body;
+
+    const user = await User.findById(req.params.id);
+    if (!user) {
+      throw new NotFoundError('用户不存在');
+    }
+
+    user.isRentalRestricted = !!restricted;
+    if (restricted) {
+      user.restrictionEndDate = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+    } else {
+      user.restrictionEndDate = null;
+      user.consecutiveOverdue = 0;
+      user.overdueOrderIds = [];
+    }
+
+    await user.save();
+
+    if (restricted) {
+      await NotificationService.rentalRestricted(user._id, user.consecutiveOverdue);
+    }
+
+    successResponse(res, {
+      isRentalRestricted: user.isRentalRestricted,
+      restrictionEndDate: user.restrictionEndDate,
+    }, restricted ? `已限制租赁${days}天` : '已解除租赁限制');
+  }),
+
   getUnreadNotifications: asyncHandler(async (req, res) => {
     const { page, pageSize, skip } = getPaginationParams(req.query);
     const Notification = require('../models/Notification');
